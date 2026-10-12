@@ -473,8 +473,20 @@ void flash_attention_launcher(const float* d_q, const float* d_k, const float* d
         tile_q, tile_k, scale);
 }
 
-# Step 25 - causal_mask (not yet solved)
-# TODO: implement
+# Step 25 - causal_mask
+__device__ void causal_mask(float* s_tile, int q_row_start, int k_col_start,
+                            int tile_q, int tile_k, int thread_id, int num_threads) {
+    int total = tile_q * tile_k;
+    for (int i = thread_id; i < total; i += num_threads) {
+        int r = i / tile_k;
+        int c = i % tile_k;
+        int global_q = q_row_start + r;
+        int global_k = k_col_start + c;
+        if (global_k > global_q) {
+            s_tile[i] = -INFINITY;
+        }
+    }
+}
 
 # Step 26 - flash_attention_causal_kernel (not yet solved)
 # TODO: implement

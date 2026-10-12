@@ -302,8 +302,19 @@ __device__ void tile_exp(float* s_tile, const float* row_max,
     }
 }
 
-# Step 21 - tile_rowsum (not yet solved)
-# TODO: implement
+# Step 21 - tile_rowsum
+__device__ void tile_rowsum(const float* p_tile, float* row_sum_out,
+                            int tile_q, int tile_k,
+                            int thread_id, int num_threads) {
+    for (int r = thread_id; r < tile_q; r += num_threads) {
+        float s = 0.0f;
+        const float* row = p_tile + r * tile_k;
+        for (int c = 0; c < tile_k; ++c) {
+            s += row[c];
+        }
+        row_sum_out[r] = s;
+    }
+}
 
 # Step 22 - accumulate_pv (not yet solved)
 # TODO: implement

@@ -81,8 +81,18 @@ __device__ float dot_product(const float* a, const float* b, int n) {
     return acc;
 }
 
-# Step 7 - matmul (not yet solved)
-# TODO: implement
+# Step 7 - matmul
+__global__ void matmul(const float* a, const float* b, float* c, int m, int k, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;  // column of C
+    int i = blockIdx.y * blockDim.y + threadIdx.y;  // row of C
+    if (i < m && j < n) {
+        float acc = 0.0f;
+        for (int l = 0; l < k; ++l) {
+            acc += a[i * k + l] * b[l * n + j];
+        }
+        c[i * n + j] = acc;
+    }
+}
 
 # Step 8 - transpose (not yet solved)
 # TODO: implement

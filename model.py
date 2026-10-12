@@ -181,8 +181,40 @@ __global__ void pv_matmul(const float* p, const float* v, float* out, int seq_le
     }
 }
 
-# Step 12 - naive_attention (not yet solved)
-# TODO: implement
+# Step 12 - naive_attention
+void naive_attention(const float* d_q, const float* d_k, const float* d_v, float* d_out, int seq_len, int head_dim) {
+    // Allocate scratch for the (seq_len x seq_len) score / probability matrix
+    float* d_scores = nullptr;
+    size_t scores_bytes = (size_t)seq_len * (size_t)seq_len * sizeof(float);
+    cudaMalloc(&d_scores, scores_bytes);
+
+    // 1) scores = Q K^T / sqrt(head_dim)
+    {
+        dim3 block(16, 16);
+        dim3 grid((seq_len + block.x - 1) / block.x,
+                  (seq_len + block.y - 1) / block.y);
+        qk_scores<<<grid, block>>>(d_q, d_k, d_scores, seq_len, head_dim);
+    }
+
+    // 2) softmax_rows in place, one block per row
+    {
+        int blockSize = 128;
+        while (blockSize < seq_len && blockSize < 1024) blockSize <<= 1;
+        if (blockSize > 1024) blockSize = 1024;
+        size_t smem = (size_t)blockSize * sizeof(float);
+        softmax_rows<<<seq_len, blockSize, smem>>>(d_scores, seq_len, seq_len);
+    }
+
+    // 3) out = P V
+    {
+        dim3 block(16, 16);
+        dim3 grid((head_dim + block.x - 1) / block.x,
+                  (seq_len  + block.y - 1) / block.y);
+        pv_matmul<<<grid, block>>>(d_scores, d_v, d_out, seq_len, head_dim);
+    }
+
+    cudaFree(d_scores);
+}
 
 # Step 13 - online_max (not yet solved)
 # TODO: implement

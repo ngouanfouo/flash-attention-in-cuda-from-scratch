@@ -488,6 +488,130 @@ __device__ void causal_mask(float* s_tile, int q_row_start, int k_col_start,
     }
 }
 
-# Step 26 - flash_attention_causal_kernel (not yet solved)
-# TODO: implement
+# Step 26 - flash_attention_causal_kernel
+__global__ void flash_attention_causal_kernel(const float* q, const float* k, const float* v,
+                                              float* out, int seq_len, int head_dim,
+                                              int tile_q, int tile_k, float scale) {
+    extern __shared__ float smem[];
+
+    // Layout:
+    //   q_smem [tile_q * head_dim]
+    //   k_smem [tile_k * head_dim]
+    //   v_smem [tile_k * head_dim]
+    //   s_smem [tile_q * tile_k]
+    //   m_tile [tile_q]  (tile row max, then reused as per-row alpha)
+    //   l_tile [tile_q]  (tile row sum)
+    //   m_run  [tile_q]  (running max)
+    //   l_run  [tile_q]  (running sum)
+    //   o_acc  [tile_q * head_dim]
+    float* q_smem = smem;
+    float* k_smem = q_smem + tile_q * head_dim;
+    float* v_smem = k_smem + tile_k * head_dim;
+    float* s_smem = v_smem + tile_k * head_dim;
+    float* m_tile = s_smem + tile_q * tile_k;
+    float* l_tile = m_tile + tile_q;
+    float* m_run  = l_tile + tile_q;
+    float* l_run  = m_run + tile_q;
+    float* o_acc  = l_run + tile_q;
+
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+    int q_row_start = blockIdx.x * tile_q;
+    int q_row_end   = q_row_start + tile_q - 1;   // last absolute query row in this tile
+
+    // --- Load Q tile once ---
+    load_tile(q, q_smem, q_row_start, 0, seq_len, head_dim,
+              tile_q, head_dim, tid, nt);
+    __syncthreads();
+
+    // --- Init running state ---
+    for (int r = tid; r < tile_q; r += nt) {
+        m_run[r] = -INFINITY;
+        l_run[r] = 0.0f;
+    }
+    for (int i = tid; i < tile_q * head_dim; i += nt) {
+        o_acc[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // --- Stream over K/V tiles ---
+    for (int k_start = 0; k_start < seq_len; k_start += tile_k) {
+        // Skip key tiles entirely to the right of this query tile (fully masked)
+        if (k_start > q_row_end) break;
+
+        load_tile(k, k_smem, k_start, 0, seq_len, head_dim,
+                  tile_k, head_dim, tid, nt);
+        load_tile(v, v_smem, k_start, 0, seq_len, head_dim,
+                  tile_k, head_dim, tid, nt);
+        __syncthreads();
+
+        // S = scale * Q_tile * K_tile^T
+        tile_scores(q_smem, k_smem, s_smem, tile_q, tile_k, head_dim, scale, tid, nt);
+        __syncthreads();
+
+        // Apply causal mask on raw scores, before any softmax step
+        causal_mask(s_smem, q_row_start, k_start, tile_q, tile_k, tid, nt);
+        __syncthreads();
+
+        // Also mask keys past seq_len (ragged edge) with -inf
+        for (int i = tid; i < tile_q * tile_k; i += nt) {
+            int j = i % tile_k;
+            if (k_start + j >= seq_len) {
+                s_smem[i] = -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Per-tile row max (over the surviving entries)
+        tile_rowmax(s_smem, m_tile, tile_q, tile_k, tid, nt);
+        __syncthreads();
+
+        // Update running max; stash alpha = exp(m_old - m_new) into m_tile
+        for (int r = tid; r < tile_q; r += nt) {
+            float m_new = fmaxf(m_run[r], m_tile[r]);
+            float alpha = correction_factor(m_run[r], m_new);
+            m_tile[r] = alpha;
+            m_run[r]  = m_new;
+        }
+        __syncthreads();
+
+        // Rescale running output and running sum into the new max frame
+        for (int i = tid; i < tile_q * head_dim; i += nt) {
+            int r = i / head_dim;
+            o_acc[i] *= m_tile[r];
+        }
+        for (int r = tid; r < tile_q; r += nt) {
+            l_run[r] *= m_tile[r];
+        }
+        __syncthreads();
+
+        // P_tile = exp(S - m_run) in place; masked -inf gives exactly 0
+        tile_exp(s_smem, m_run, tile_q, tile_k, tid, nt);
+        __syncthreads();
+
+        // Per-tile row sum added into running denominator
+        tile_rowsum(s_smem, l_tile, tile_q, tile_k, tid, nt);
+        __syncthreads();
+
+        for (int r = tid; r < tile_q; r += nt) {
+            l_run[r] += l_tile[r];
+        }
+        __syncthreads();
+
+        // o_acc += P_tile * V_tile
+        accumulate_pv(s_smem, v_smem, o_acc, tile_q, tile_k, head_dim, tid, nt);
+        __syncthreads();
+    }
+
+    // --- Normalize and write out ---
+    for (int i = tid; i < tile_q * head_dim; i += nt) {
+        int r = i / head_dim;
+        int d = i % head_dim;
+        int gr = q_row_start + r;
+        if (gr < seq_len) {
+            float l = l_run[r];
+            out[gr * head_dim + d] = (l > 0.0f) ? (o_acc[i] / l) : 0.0f;
+        }
+    }
+}
 
